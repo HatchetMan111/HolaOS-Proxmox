@@ -29,6 +29,7 @@ elif [ "$(id -u)" -ne 0 ] && [ -n "${HOME:-}" ]; then
   INSTALL_DIR="${HOME}/holaboss-ai"
 fi
 WITH_DESKTOP=0
+WITH_WEBTERM=0
 SKIP_BUILD=0
 LOG_FILE="/var/log/holaos-install.log"
 
@@ -55,6 +56,7 @@ Options:
   --ref NAME        git branch/tag (default: main)
   --with-desktop    additionally install Ubuntu Desktop + xRDP
                     (needed to actually SEE the Electron app in the VM)
+  --with-webterm    install ttyd web terminal on port 7680 (browser login)
   --skip-build      only install prerequisites + clone, no bun install/build
   -h, --help        show this help
 EOF
@@ -70,6 +72,7 @@ while [[ $# -gt 0 ]]; do
     --dir) INSTALL_DIR="$2"; shift 2 ;;
     --ref|--branch) REF="$2"; shift 2 ;;
     --with-desktop) WITH_DESKTOP=1; shift ;;
+    --with-webterm) WITH_WEBTERM=1; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) fail "Unknown option: $1 (see --help)" ;;
@@ -170,6 +173,44 @@ if [ "${WITH_DESKTOP}" -eq 1 ]; then
   apt-get install -y ubuntu-desktop-minimal xrdp
   systemctl enable --now xrdp
   ok "Desktop ready — connect via SPICE console or RDP"
+fi
+
+# ---------- 4b. optional web terminal (ttyd on :7680 with system login) ----------
+if [ "${WITH_WEBTERM}" -eq 1 ]; then
+  msg "Installing ttyd web terminal (port 7680, login with VM user account)..."
+  if ! command -v ttyd >/dev/null 2>&1; then
+    if apt-get install -y ttyd 2>/dev/null; then
+      ok "ttyd installed via apt"
+    else
+      TTYD_VER="1.7.7"; TTYD_ARCH=""
+      case "$(uname -m)" in
+        x86_64|amd64) TTYD_ARCH="x86_64" ;;
+        arm64|aarch64) TTYD_ARCH="aarch64" ;;
+        *) fail "Unsupported architecture for ttyd: $(uname -m)" ;;
+      esac
+      curl -fsSL -o /usr/local/bin/ttyd "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VER}/ttyd.${TTYD_ARCH}"
+      chmod +x /usr/local/bin/ttyd
+      ok "ttyd ${TTYD_VER} installed to /usr/local/bin/ttyd"
+    fi
+  else
+    ok "ttyd already installed"
+  fi
+  TTYD_BIN="$(command -v ttyd)"
+  cat > /etc/systemd/system/ttyd.service <<EOF
+[Unit]
+Description=ttyd web terminal (holaOS)
+After=network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=${TTYD_BIN} --writable -p 7680 login
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now ttyd
+  ok "Web terminal ready: http://<VM-IP>:7680 (login with VM user account)"
 fi
 
 # ---------- 5. clone / update ----------

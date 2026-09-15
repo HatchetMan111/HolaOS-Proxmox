@@ -32,6 +32,7 @@ post_update_to_api_safe() { command -v post_update_to_api >/dev/null 2>&1 && pos
 HOLAOS_INSTALL_URL="${HOLAOS_INSTALL_URL:-https://raw.githubusercontent.com/HatchetMan111/HolaOS-Proxmox/main/holaos-install.sh}"
 HOLAOS_REF="${HOLAOS_REF:-main}"
 HOLAOS_WITH_DESKTOP="${HOLAOS_WITH_DESKTOP:-0}"
+HOLAOS_WITH_WEBTERM="${HOLAOS_WITH_WEBTERM:-1}"
 HOLAOS_REPO_URL="https://github.com/holaboss-ai/holaOS.git"
 
 function header_info {
@@ -370,7 +371,8 @@ if [ "${AUTOINSTALL}" == "yes" ]; then
       mkdir -p "${SNIP_PATH}"
       VENDOR_FILE="${SNIP_PATH}/holaos-${VMID}-vendor.yaml"
       EXTRA_ARGS=""
-      [ "${HOLAOS_WITH_DESKTOP}" == "1" ] && EXTRA_ARGS=" --with-desktop"
+      [ "${HOLAOS_WITH_DESKTOP}" == "1" ] && EXTRA_ARGS="${EXTRA_ARGS} --with-desktop"
+      [ "${HOLAOS_WITH_WEBTERM}" == "1" ] && EXTRA_ARGS="${EXTRA_ARGS} --with-webterm"
       cat > "${VENDOR_FILE}" <<EOF
 #cloud-config
 package_update: true
@@ -470,6 +472,8 @@ if ss -ltn 2>/dev/null | grep -q ':8006 '; then PVE_8006="offen (pveproxy lausch
 if systemctl is-active --quiet pveproxy 2>/dev/null; then PVE_8006="${PVE_8006}, pveproxy aktiv"; else PVE_8006="${PVE_8006}, pveproxy NICHT aktiv!"; fi
 if [[ -n "$VM_IP" ]]; then
   if nc -z -w 3 "$VM_IP" 22 2>/dev/null; then SSH22="offen"; else SSH22="noch zu (bootet noch / Firewall)"; fi
+  WEB7680="unbekannt"
+  if nc -z -w 3 "$VM_IP" 7680 2>/dev/null; then WEB7680="offen"; else WEB7680="noch zu (Auto-Install läuft noch?)"; fi
 fi
 echo -e " ── holaOS Ergebnis ───────────────────────────────────"
 if [[ "${START_VM}" == "yes" && "${START_RC:-1}" -eq 0 && -n "$VM_IP" ]]; then
@@ -485,13 +489,14 @@ echo -e " CI-User:   ${CI_USER}   Passwort: ${CI_PASS}  (bitte notieren!)"
 if [[ -n "$VM_IP" ]]; then
   echo -e " VM-IP:     $VM_IP  (SSH-Port 22: $SSH22)"
   echo -e " SSH:       ssh ${CI_USER}@${VM_IP}"
+  echo -e " Webterminal: http://${VM_IP}:7680  (Port 7680: $WEB7680, Login mit VM-Benutzer)"
   echo -e " Proxmox-Web: https://${PVE_IP}:8006 → VM $VMID → Konsole (Port 8006: $PVE_8006)"
-  echo -e " Hinweis:   Die VM selbst hat KEINEN Webserver (holaOS ist Electron, kein Webdienst)."
-  echo -e "            Browser-Zugang = Proxmox-Web → noVNC-Konsole; GUI per RDP nur mit --with-desktop (Port 3389)."
+  echo -e " Hinweis:   holaOS selbst ist Electron (kein Webdienst) — Browser-Zugang = Webterminal + Proxmox-noVNC."
 else
   echo -e " SSH:       ssh ${CI_USER}@<VM-IP>  (IP holen: qm guest cmd $VMID network-get-interfaces)"
+  echo -e " Webterminal: kommt mit Auto-Install auf http://<VM-IP>:7680 (ttyd, Login mit VM-Benutzer)"
   echo -e " Proxmox-Web: https://${PVE_IP}:8006 → VM $VMID → Konsole (Port 8006: $PVE_8006)"
-  echo -e " Hinweis:   Die VM selbst hat KEINEN Webserver (holaOS ist Electron, kein Webdienst)."
+  echo -e " Hinweis:   holaOS selbst ist Electron (kein Webdienst) — Browser-Zugang = Webterminal + Proxmox-noVNC."
 fi
 echo -e " Diagnose auf dem Host:"
 echo -e "   qm status $VMID; ss -ltn | grep 8006; systemctl status pveproxy --no-pager | head -5"

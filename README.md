@@ -17,9 +17,11 @@ Mit Advanced-Setup (Whiptail):
 Mit Env-Overrides:
 
 ```bash
-HOLAOS_REF="main" HOLAOS_WITH_DESKTOP=1 \
+HOLAOS_REF="main" HOLAOS_WITH_DESKTOP=1 HOLAOS_WITH_WEBTERM=1 \
 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/HolaOS-Proxmox/main/holaos-vm.sh)"
 ```
+
+`HOLAOS_WITH_WEBTERM=1` ist Standard: der Auto-Install richtet dann ein **Webterminal (ttyd) auf `http://<VM-IP>:7680`** ein (Login mit VM-Benutzer) — das ist die Browser-Oberfläche zur VM. holaOS selbst bleibt eine **Electron-Desktop-App** ohne eigenen Webserver.
 
 ## Falls kein Auto-Install (kein snippets-Storage)
 
@@ -51,7 +53,7 @@ cd ~/holaboss-ai && npm run desktop:dev
 6. `npm run desktop:prepare-runtime:local`
 7. `npm run desktop:typecheck`
 
-Flags: `--dir PATH`, `--ref NAME`, `--with-desktop`, `--skip-build`, `--help`
+Flags: `--dir PATH`, `--ref NAME`, `--with-desktop`, `--with-webterm`, `--skip-build`, `--help`
 
 ## Dateien
 
