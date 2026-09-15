@@ -457,8 +457,20 @@ if [[ "${START_VM}" == "yes" && "${START_RC:-1}" -eq 0 ]]; then
   if [[ -n "$VM_IP" ]]; then msg_ok "VM-IP: ${CL}${BL}${VM_IP}${CL}"; AGENT_STATE="ok";
   else msg_error "Noch keine VM-IP (Agent/DHCP braucht noch) — unten Fallback prüfen"; AGENT_STATE="pending"; fi
 fi
-PVE_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+# PVE-LAN-IP robust bestimmen: Quell-IP der Default-Route (nicht blind hostname -I #1,
+# das kann Docker/Tailscale sein). Fallback: erste RFC1918-Adresse aus hostname -I.
+PVE_IP="$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -1 || true)"
+if [[ -z "$PVE_IP" ]]; then
+  PVE_IP="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' | head -1 || true)"
+fi
 [[ -z "$PVE_IP" ]] && PVE_IP="<PVE-IP>"
+# Erreichbarkeits-Checks direkt auf dem Host (sehen, nicht raten).
+PVE_8006="unbekannt"; SSH22="unbekannt"
+if ss -ltn 2>/dev/null | grep -q ':8006 '; then PVE_8006="offen (pveproxy lauscht)"; else PVE_8006="ZU (pveproxy/firewall prüfen!)"; fi
+if systemctl is-active --quiet pveproxy 2>/dev/null; then PVE_8006="${PVE_8006}, pveproxy aktiv"; else PVE_8006="${PVE_8006}, pveproxy NICHT aktiv!"; fi
+if [[ -n "$VM_IP" ]]; then
+  if nc -z -w 3 "$VM_IP" 22 2>/dev/null; then SSH22="offen"; else SSH22="noch zu (bootet noch / Firewall)"; fi
+fi
 echo -e " ── holaOS Ergebnis ───────────────────────────────────"
 if [[ "${START_VM}" == "yes" && "${START_RC:-1}" -eq 0 && -n "$VM_IP" ]]; then
   echo -e " Status:    ✅ GESTARTET, sauber durchgelaufen (Agent: ok, IP: $VM_IP)"
@@ -471,13 +483,19 @@ fi
 echo -e " VMID:      $VMID   Hostname: $HN"
 echo -e " CI-User:   ${CI_USER}   Passwort: ${CI_PASS}  (bitte notieren!)"
 if [[ -n "$VM_IP" ]]; then
-  echo -e " VM-IP:     $VM_IP"
+  echo -e " VM-IP:     $VM_IP  (SSH-Port 22: $SSH22)"
   echo -e " SSH:       ssh ${CI_USER}@${VM_IP}"
-  echo -e " Web/Oberfläche (Proxmox): https://${PVE_IP}:8006 → VM $VMID → Konsole"
+  echo -e " Proxmox-Web: https://${PVE_IP}:8006 → VM $VMID → Konsole (Port 8006: $PVE_8006)"
+  echo -e " Hinweis:   Die VM selbst hat KEINEN Webserver (holaOS ist Electron, kein Webdienst)."
+  echo -e "            Browser-Zugang = Proxmox-Web → noVNC-Konsole; GUI per RDP nur mit --with-desktop (Port 3389)."
 else
   echo -e " SSH:       ssh ${CI_USER}@<VM-IP>  (IP holen: qm guest cmd $VMID network-get-interfaces)"
-  echo -e " Web/Oberfläche (Proxmox): https://${PVE_IP}:8006 → VM $VMID → Konsole"
+  echo -e " Proxmox-Web: https://${PVE_IP}:8006 → VM $VMID → Konsole (Port 8006: $PVE_8006)"
+  echo -e " Hinweis:   Die VM selbst hat KEINEN Webserver (holaOS ist Electron, kein Webdienst)."
 fi
+echo -e " Diagnose auf dem Host:"
+echo -e "   qm status $VMID; ss -ltn | grep 8006; systemctl status pveproxy --no-pager | head -5"
+echo -e "   qm guest cmd $VMID network-get-interfaces  # echte VM-IP"
 if [ "$SNIPPET_OK" == "yes" ]; then
   echo -e " Auto-Install: LÄUFT beim ersten Boot (~10-20 Min). Log in der VM:"
   echo -e "   tail -f /var/log/holaos-install.log  /  cloud-init status --wait"
