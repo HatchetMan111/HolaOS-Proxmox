@@ -397,7 +397,9 @@ if [ "${AUTOINSTALL}" == "yes" ]; then
       mkdir -p "${SNIP_PATH}"
       VENDOR_FILE="${SNIP_PATH}/holaos-${VMID}-vendor.yaml"
       EXTRA_ARGS=""
-      [ "${HOLAOS_WITH_DESKTOP}" == "1" ] && EXTRA_ARGS="${EXTRA_ARGS} --with-desktop"
+      if [ "${HOLAOS_WITH_DESKTOP}" == "1" ]; then
+        EXTRA_ARGS="${EXTRA_ARGS} --with-desktop --gui-user ${CI_USER}"
+      fi
       [ "${HOLAOS_WITH_WEBTERM}" == "1" ] && EXTRA_ARGS="${EXTRA_ARGS} --with-webterm"
       cat > "${VENDOR_FILE}" <<EOF
 #cloud-config

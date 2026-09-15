@@ -30,6 +30,7 @@ elif [ "$(id -u)" -ne 0 ] && [ -n "${HOME:-}" ]; then
 fi
 WITH_DESKTOP=0
 WITH_WEBTERM=0
+GUI_USER=""
 SKIP_BUILD=0
 LOG_FILE="/var/log/holaos-install.log"
 
@@ -57,6 +58,8 @@ Options:
   --with-desktop    additionally install Ubuntu Desktop + xRDP
                     (needed to actually SEE the Electron app in the VM)
   --with-webterm    install ttyd web terminal on port 7680 (browser login)
+  --gui-user NAME   graphical user for desktop autostart + checkout ownership
+                    (default: SUDO_USER, e.g. passed as --gui-user hola by cloud-init)
   --skip-build      only install prerequisites + clone, no bun install/build
   -h, --help        show this help
 EOF
@@ -69,15 +72,17 @@ fail() { echo -e "${RED}x${CL} $1" >&2; exit 1; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dir) INSTALL_DIR="$2"; shift 2 ;;
+    --dir) INSTALL_DIR="$2"; DIR_GIVEN=1; shift 2 ;;
     --ref|--branch) REF="$2"; shift 2 ;;
     --with-desktop) WITH_DESKTOP=1; shift ;;
     --with-webterm) WITH_WEBTERM=1; shift ;;
+    --gui-user) GUI_USER="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) fail "Unknown option: $1 (see --help)" ;;
   esac
 done
+DIR_GIVEN="${DIR_GIVEN:-0}"
 
 if [ "$(id -u)" -ne 0 ]; then
   fail "Please run as root (use sudo): curl ... | sudo bash"
@@ -87,6 +92,17 @@ fi
 # knallt sonst jedes ${HOME} (auch im bun-Upstream-Installer). Daher hier auffüllen.
 export HOME="${HOME:-/root}"
 export USER="${USER:-root}"
+
+# Ausführender Nicht-Root-User: SUDO_USER oder explizit --gui-user (Cloud-Init: hola).
+# Mit GUI-User wandert der Checkout ins Home des Users und bun nach /opt (lesbar für alle),
+# damit die Electron-GUI später als dieser User läuft statt als root.
+RUN_USER=""
+if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then RUN_USER="$SUDO_USER"; fi
+if [ -n "${GUI_USER:-}" ] && [ "${GUI_USER}" != "root" ] && id "${GUI_USER}" >/dev/null 2>&1; then
+  RUN_USER="$GUI_USER"
+  if [ "$DIR_GIVEN" -eq 0 ]; then INSTALL_DIR="$(getent passwd "$GUI_USER" | cut -d: -f6)/holaboss-ai"; fi
+  BUN_DIR="/opt/bun"
+fi
 
 mkdir -p "$(dirname "${LOG_FILE}")"
 touch "${LOG_FILE}"
@@ -170,7 +186,8 @@ install_bun() {
   curl -fsSL https://bun.sh/install | BUN_VERSION="${BUN_VERSION}" BUN_INSTALL="${BUN_DIR}" bash
   ln -sf "${BUN_DIR}/bin/bun" /usr/local/bin/bun
   ln -sf "${BUN_DIR}/bin/bunx" /usr/local/bin/bunx 2>/dev/null || true
-  if [ "$OWNER_USER" != "root" ]; then chown -R "${OWNER_USER}:${OWNER_USER}" "${BUN_DIR}"; fi
+  if [ -n "${RUN_USER:-}" ]; then chown -R "${RUN_USER}:${RUN_USER}" "${BUN_DIR}"; fi
+  chmod 755 "${BUN_DIR}" "${BUN_DIR}/bin" 2>/dev/null || true
   export PATH="${BUN_DIR}/bin:/usr/local/node-holaos/bin:${PATH}"
   ok "bun ready ($(bun --version))"
   if ! grep -q '.bun/bin' /etc/profile.d/holaos.sh 2>/dev/null; then
@@ -186,8 +203,11 @@ if [ "${WITH_DESKTOP}" -eq 1 ]; then
   apt-get install -y ubuntu-desktop-minimal xrdp
   systemctl enable --now xrdp
   # GUI-Autostart beim grafischen Login (RDP/Konsole): holaOS Dev startet von selbst.
-  if [ "$OWNER_USER" != "root" ]; then
-    AUTOSTART_DIR="${OWNER_HOME}/.config/autostart"
+  # Der Auto-Install läuft als root, der Desktop-Login aber als GUI_USER (z.B. hola).
+  AUTOSTART_USER="${GUI_USER:-$OWNER_USER}"
+  if [ "$AUTOSTART_USER" != "root" ] && id "$AUTOSTART_USER" >/dev/null 2>&1; then
+    AUTOSTART_HOME="$(getent passwd "$AUTOSTART_USER" | cut -d: -f6)"
+    AUTOSTART_DIR="${AUTOSTART_HOME}/.config/autostart"
     mkdir -p "$AUTOSTART_DIR"
     cat > "${AUTOSTART_DIR}/holaos-desktop-dev.desktop" <<EOF
 [Desktop Entry]
@@ -198,10 +218,10 @@ Exec=bash -lc 'cd ${INSTALL_DIR} && npm run desktop:dev'
 Terminal=true
 X-GNOME-Autostart-enabled=true
 EOF
-    chown -R "${OWNER_USER}:${OWNER_USER}" "$AUTOSTART_DIR"
-    ok "Desktop ready + holaOS Autostart — per RDP einloggen, GUI startet von selbst"
+    chown -R "${AUTOSTART_USER}:${AUTOSTART_USER}" "$AUTOSTART_DIR"
+    ok "Desktop ready + holaOS Autostart für ${AUTOSTART_USER} — per RDP einloggen, GUI startet von selbst"
   else
-    warn "Desktop installiert, aber OWNER ist root — Autostart übersprungen (als normaler User installieren für Autostart)"
+    warn "Desktop installiert, aber kein GUI-User (root) — Autostart übersprungen, nutze --gui-user NAME"
     ok "Desktop ready — connect via SPICE console or RDP"
   fi
 fi
@@ -269,7 +289,9 @@ else
   ok "Repository cloned"
 fi
 cd "${INSTALL_DIR}"
-if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+if [ -n "${RUN_USER:-}" ]; then
+  chown -R "${RUN_USER}:${RUN_USER}" "${INSTALL_DIR}"
+elif [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
   chown -R "${SUDO_USER}:${SUDO_USER}" "${INSTALL_DIR}"
 fi
 
@@ -279,10 +301,11 @@ if [ "${SKIP_BUILD}" -eq 1 ]; then
   exit 0
 fi
 
-# bun install muss als Owner laufen (nicht root-nobody-quirks) — als SUDO_USER wenn vorhanden
+# Builds laufen als Nicht-Root-User wenn vorhanden (SUDO_USER oder --gui-user),
+# sonst als root mit angepasstem PATH.
 run_as_owner() {
-  if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
-    sudo -u "${SUDO_USER}" -H env PATH="${BUN_DIR}/bin:/usr/local/node-holaos/bin:/usr/local/bin:/usr/bin:/bin" "$@"
+  if [ -n "${RUN_USER:-}" ]; then
+    sudo -u "${RUN_USER}" -H env PATH="${BUN_DIR}/bin:/usr/local/node-holaos/bin:/usr/local/bin:/usr/bin:/bin" "$@"
   else
     env PATH="${BUN_DIR}/bin:/usr/local/node-holaos/bin:/usr/local/bin:/usr/bin:/bin" "$@"
   fi
