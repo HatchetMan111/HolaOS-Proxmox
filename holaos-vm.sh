@@ -210,7 +210,7 @@ function default_settings() {
   VMID=$(get_valid_nextid); FORMAT=",efitype=4m"; MACHINE=""; DISK_SIZE="40G"
   DISK_CACHE=""; HN="holaos"; CPU_TYPE=""; CORE_COUNT="4"; RAM_SIZE="8192"
   BRG="vmbr0"; MAC="$GEN_MAC"; VLAN=""; MTU=""; START_VM="yes"
-  CI_USER="hola"; AUTOINSTALL="yes"; METHOD="default"
+  CI_USER="hola"; CI_SSHKEY="${HOLAOS_SSH_PUBKEY:-}"; AUTOINSTALL="yes"; METHOD="default"
   echo -e "${CONTAINERID}${BOLD}${DGN}VM ID: ${BGN}${VMID}${CL}"
   echo -e "${HOSTNAME}${BOLD}${DGN}Hostname: ${BGN}${HN}${CL}"
   echo -e "${CPUCORE}${BOLD}${DGN}CPU: ${BGN}${CORE_COUNT} (KVM64)${CL}"
@@ -257,6 +257,16 @@ function advanced_settings() {
   else exit-script; fi
   if CI_USER=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "Cloud-Init user (SSH login)" 8 58 hola --title "CI USER" --cancel-button Exit 3>&1 1>&2 2>&3); then
     [ -z "$CI_USER" ] && CI_USER="hola"; echo -e "${DEFAULT}${BOLD}${DGN}CI user: ${BGN}$CI_USER${CL}"
+  else exit-script; fi
+  if CI_SSHKEY_IN=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "SSH Public Key (optional, leer = Login per Konsole/Passwort). Key oder Pfad, z.B. /root/.ssh/id_rsa.pub" 10 70 "${HOLAOS_SSH_PUBKEY:-}" --title "SSH KEY" --cancel-button Exit 3>&1 1>&2 2>&3); then
+    CI_SSHKEY="$CI_SSHKEY_IN"
+    if [[ -n "$CI_SSHKEY" && -f "$CI_SSHKEY" ]]; then
+      echo -e "${DEFAULT}${BOLD}${DGN}SSH key: ${BGN}aus Datei $CI_SSHKEY${CL}"
+    elif [[ -n "$CI_SSHKEY" ]]; then
+      echo -e "${DEFAULT}${BOLD}${DGN}SSH key: ${BGN}direkt hinterlegt${CL}"
+    else
+      echo -e "${DEFAULT}${BOLD}${DGN}SSH key: ${BGN}keiner (Passwort via Konsole)${CL}"
+    fi
   else exit-script; fi
   if (whiptail --backtitle "Proxmox VE Helper Scripts" --title "AUTO-INSTALL" --yesno "holaOS beim ersten Boot automatisch installieren? (braucht snippets-Storage)" 10 66); then
     AUTOINSTALL="yes"
@@ -353,6 +363,17 @@ fi
 # ---------- cloud-init user/net ----------
 CI_PASS="$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 12)"
 qm set "$VMID" --ciuser "${CI_USER}" --cipassword "${CI_PASS}" --ipconfig0 ip=dhcp --ciupgrade 0 >/dev/null
+# Optionaler SSH-Key (Datei-Pfad oder Key-String aus Advanced-Setup / HOLAOS_SSH_PUBKEY).
+if [[ -n "${CI_SSHKEY:-}" ]]; then
+  SSHKEY_FILE="${TEMP_DIR}/holaos-ssh.pub"
+  if [[ -f "$CI_SSHKEY" ]]; then cp "$CI_SSHKEY" "$SSHKEY_FILE"
+  else echo "$CI_SSHKEY" > "$SSHKEY_FILE"; fi
+  if qm set "$VMID" --sshkeys "$SSHKEY_FILE" >/dev/null 2>&1; then
+    msg_ok "Cloud-Init: SSH-Key hinterlegt"
+  else
+    msg_error "SSH-Key konnte nicht gesetzt werden — weiter ohne Key"
+  fi
+fi
 msg_ok "Cloud-Init: user=${CL}${BL}${CI_USER}${CL} / DHCP / qemu-agent on"
 
 # ---------- vendor snippet for auto-install ----------
@@ -377,7 +398,11 @@ if [ "${AUTOINSTALL}" == "yes" ]; then
 #cloud-config
 package_update: true
 package_upgrade: false
-packages: [curl, ca-certificates, qemu-guest-agent]
+# Ubuntu-Cloud-Images verweigern SSH-Passwort-Login per Default (Permission denied
+# (publickey) trotz gesetztem cipassword). Zusammen mit dem Passwort aus `qm set`
+# erlaubt das den Login per Konsole UND per SSH.
+ssh_pwauth: true
+packages: [curl, ca-certificates, qemu-guest-agent, openssh-server]
 runcmd:
   - systemctl enable --now qemu-guest-agent
   - curl -fsSL ${HOLAOS_INSTALL_URL} -o /root/holaos-install.sh
