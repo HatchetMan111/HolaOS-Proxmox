@@ -220,6 +220,7 @@ function default_settings() {
   echo -e "${MACADDRESS}${BOLD}${DGN}MAC: ${BGN}${MAC}${CL}"
   echo -e "${DEFAULT}${BOLD}${DGN}Cloud-Init user: ${BGN}${CI_USER}${CL}"
   echo -e "${DEFAULT}${BOLD}${DGN}holaOS auto-install: ${BGN}${AUTOINSTALL}${CL}"
+  echo -e "${DEFAULT}${BOLD}${DGN}Desktop+RDP: ${BGN}${HOLAOS_WITH_DESKTOP} (Env: HOLAOS_WITH_DESKTOP=1 für GUI)${CL}"
   echo -e "${GATEWAY}${BOLD}${DGN}Start when done: ${BGN}yes${CL}"
   echo -e "${CREATING}${BOLD}${DGN}Creating holaOS VM with defaults${CL}"
 }
@@ -272,6 +273,10 @@ function advanced_settings() {
     AUTOINSTALL="yes"
   else AUTOINSTALL="no"; fi
   echo -e "${DEFAULT}${BOLD}${DGN}Auto-install: ${BGN}$AUTOINSTALL${CL}"
+  if (whiptail --backtitle "Proxmox VE Helper Scripts" --title "DESKTOP+RDP" --yesno "Ubuntu Desktop + RDP mitinstallieren? (echte GUI für die Electron-App, +~3 GB, dauert länger)" 10 70); then
+    HOLAOS_WITH_DESKTOP="1"
+  else HOLAOS_WITH_DESKTOP="0"; fi
+  echo -e "${DEFAULT}${BOLD}${DGN}Desktop+RDP: ${BGN}$HOLAOS_WITH_DESKTOP${CL}"
   if (whiptail --backtitle "Proxmox VE Helper Scripts" --title "START VM" --yesno "VM nach Erstellung starten?" 10 58); then START_VM="yes"; else START_VM="no"; fi
   echo -e "${GATEWAY}${BOLD}${DGN}Start: ${BGN}$START_VM${CL}"
   FORMAT=",efitype=4m"; MACHINE=""; DISK_CACHE=""; CPU_TYPE=""; MAC="$GEN_MAC"; VLAN=""; MTU=""
@@ -507,6 +512,10 @@ if [[ -n "$VM_IP" ]]; then
   if nc -z -w 3 "$VM_IP" 22 2>/dev/null; then SSH22="offen"; else SSH22="noch zu (bootet noch / Firewall)"; fi
   WEB7680="unbekannt"
   if nc -z -w 3 "$VM_IP" 7680 2>/dev/null; then WEB7680="offen"; else WEB7680="noch zu (Auto-Install läuft noch?)"; fi
+  RDP3389="unbekannt"
+  if [[ "$HOLAOS_WITH_DESKTOP" == "1" ]]; then
+    if nc -z -w 3 "$VM_IP" 3389 2>/dev/null; then RDP3389="offen"; else RDP3389="noch zu (Desktop-Install läuft noch?)"; fi
+  else RDP3389="nicht installiert (HOLAOS_WITH_DESKTOP=1)"; fi
 fi
 echo -e " ── holaOS Ergebnis ───────────────────────────────────"
 if [[ "${START_VM}" == "yes" && "${START_RC:-1}" -eq 0 && -n "$VM_IP" ]]; then
@@ -523,6 +532,10 @@ if [[ -n "$VM_IP" ]]; then
   echo -e " VM-IP:     $VM_IP  (SSH-Port 22: $SSH22)"
   echo -e " SSH:       ssh ${CI_USER}@${VM_IP}"
   echo -e " Webterminal: http://${VM_IP}:7680  (Port 7680: $WEB7680, Login mit VM-Benutzer)"
+  if [[ "$HOLAOS_WITH_DESKTOP" == "1" ]]; then
+    echo -e " RDP (echte GUI): ${VM_IP}:3389  (Port 3389: $RDP3389, Remmina/Windows-RDP, Login ${CI_USER})"
+    echo -e "            holaOS startet nach dem RDP-Login von selbst (Autostart)."
+  fi
   echo -e " Proxmox-Web: https://${PVE_IP}:8006 → VM $VMID → Konsole (Port 8006: $PVE_8006)"
   echo -e " Hinweis:   holaOS selbst ist Electron (kein Webdienst) — Browser-Zugang = Webterminal + Proxmox-noVNC."
 else

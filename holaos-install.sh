@@ -185,7 +185,25 @@ if [ "${WITH_DESKTOP}" -eq 1 ]; then
   msg "Installing Ubuntu Desktop + xRDP (takes a while)..."
   apt-get install -y ubuntu-desktop-minimal xrdp
   systemctl enable --now xrdp
-  ok "Desktop ready — connect via SPICE console or RDP"
+  # GUI-Autostart beim grafischen Login (RDP/Konsole): holaOS Dev startet von selbst.
+  if [ "$OWNER_USER" != "root" ]; then
+    AUTOSTART_DIR="${OWNER_HOME}/.config/autostart"
+    mkdir -p "$AUTOSTART_DIR"
+    cat > "${AUTOSTART_DIR}/holaos-desktop-dev.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=holaOS Dev
+Comment=holaOS Electron dev server (auto-started)
+Exec=bash -lc 'cd ${INSTALL_DIR} && npm run desktop:dev'
+Terminal=true
+X-GNOME-Autostart-enabled=true
+EOF
+    chown -R "${OWNER_USER}:${OWNER_USER}" "$AUTOSTART_DIR"
+    ok "Desktop ready + holaOS Autostart — per RDP einloggen, GUI startet von selbst"
+  else
+    warn "Desktop installiert, aber OWNER ist root — Autostart übersprungen (als normaler User installieren für Autostart)"
+    ok "Desktop ready — connect via SPICE console or RDP"
+  fi
 fi
 
 # ---------- 4b. optional web terminal (ttyd on :7680 with system login) ----------
