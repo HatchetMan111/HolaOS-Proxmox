@@ -222,8 +222,17 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now ttyd
-  ok "Web terminal ready: http://<VM-IP>:7680 (login with VM user account)"
+  systemctl enable ttyd >/dev/null 2>&1 || true
+  # restart statt nur start: ein fremder/laufender ttyd (z.B. apt-Default auf lo:7681)
+  # würde sonst mit falschen Args weiterlaufen.
+  systemctl restart ttyd
+  sleep 2
+  if ss -ltn 2>/dev/null | grep -q ':7680 '; then
+    ok "Web terminal ready: http://<VM-IP>:7680 (login with VM user account)"
+  else
+    warn "ttyd aktiv, aber Port 7680 lauscht nicht — journalctl -u ttyd prüfen"
+    systemctl status ttyd --no-pager | head -8 || true
+  fi
 fi
 
 # ---------- 5. clone / update ----------
