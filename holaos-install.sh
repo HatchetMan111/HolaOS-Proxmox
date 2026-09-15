@@ -97,6 +97,14 @@ else
   warn "No /etc/os-release found, continuing anyway"
 fi
 
+# ---------- 0b. Plattenplatz (früh und verständlich scheitern, nicht mitten im Build) ----------
+REQ_GB=10
+AVAIL_KB="$(df -k / | awk 'NR==2 {print $4}')"
+if [ "${AVAIL_KB:-0}" -lt $((REQ_GB*1024*1024)) ]; then
+  fail "Zu wenig Platz auf / ($((AVAIL_KB/1024/1024))G frei, ${REQ_GB}G nötig). Auf dem Proxmox-Host: qm resize <VMID> scsi0 +20G — in der VM: growpart /dev/sda 1 && resize2fs /dev/sda1"
+fi
+ok "Plattenplatz ok ($((AVAIL_KB/1024/1024))G frei auf /)"
+
 # ---------- 1. system packages ----------
 msg "Installing system packages (git, curl, build tools)..."
 export DEBIAN_FRONTEND=noninteractive

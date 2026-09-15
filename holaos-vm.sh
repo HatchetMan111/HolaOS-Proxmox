@@ -442,8 +442,16 @@ DESCRIPTION=$(cat <<EOF
 EOF
 )
 qm set "$VMID" -description "$DESCRIPTION" >/dev/null
-# Hinweis: scsi0 wurde oben bereits mit size=${DISK_SIZE} angelegt — kein qm resize nötig.
-# (Ein erneutes `qm resize ... ${DISK_SIZE}` auf dieselbe Größe schlägt fehl.)
+# scsi0 kommt aus dem ~2-3 GB Cloud-Image: `size=` in `qm set` wächst ein bereits
+# importiertes Volume NICHT (Platte blieb 3,5 GB statt 30 GB -> ENOSPC im Installer).
+# Daher explizit resizen und am `qm config` verifizieren.
+qm resize "$VMID" scsi0 "$DISK_SIZE" >/dev/null
+if qm config "$VMID" 2>/dev/null | grep -E '^scsi0:' | grep -q "size=${DISK_SIZE}"; then
+  msg_ok "Disk scsi0 auf ${CL}${BL}${DISK_SIZE}${CL} erweitert"
+else
+  msg_error "Resize-Verifikation fehlgeschlagen (qm config scsi0 prüfen!)"
+  qm config "$VMID" 2>/dev/null | grep -E '^scsi0:' || true
+fi
 msg_ok "Created holaOS VM ${CL}${BL}(${HN}, #${VMID})${CL}"
 
 if [ "$START_VM" == "yes" ]; then
