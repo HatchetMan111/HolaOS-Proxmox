@@ -338,8 +338,12 @@ for i in 0 1; do disk="DISK$i"; eval DISK${i}=vm-${VMID}-disk-${i}${DISK_EXT:-};
 
 # ---------- create VM ----------
 msg_info "Creating holaOS VM"
+# Mit Desktop: SPICE-Display (qxl) für Konsole/Remote-Viewer inkl. Resize/Clipboard
+# (mit spice-vdagent im Gast, installiert der Installer bei --with-desktop).
+VGA_OPT=""
+if [ "${HOLAOS_WITH_DESKTOP}" == "1" ]; then VGA_OPT="-vga qxl"; fi
 qm create "$VMID" -agent 1"${MACHINE}" -tablet 0 -localtime 1 -bios ovmf"${CPU_TYPE}" -cores "$CORE_COUNT" -memory "$RAM_SIZE" \
-  -name "$HN" -tags community-script,holaos -net0 virtio,bridge="$BRG",macaddr="$MAC$VLAN$MTU" -onboot 1 -ostype l26 -scsihw virtio-scsi-pci
+  -name "$HN" -tags community-script,holaos -net0 virtio,bridge="$BRG",macaddr="$MAC$VLAN$MTU" -onboot 1 -ostype l26 -scsihw virtio-scsi-pci ${VGA_OPT}
 VM_CREATED="yes"
 pvesm alloc "$STORAGE" "$VMID" "$DISK0" 4M 1>&/dev/null
 qm importdisk "$VMID" "${FILE}" "$STORAGE" ${DISK_IMPORT:-} 1>&/dev/null

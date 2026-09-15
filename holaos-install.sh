@@ -199,8 +199,8 @@ export PATH="${BUN_DIR}/bin:/usr/local/node-holaos/bin:${PATH}"
 
 # ---------- 4. optional desktop (for Electron GUI) ----------
 if [ "${WITH_DESKTOP}" -eq 1 ]; then
-  msg "Installing Ubuntu Desktop + xRDP (takes a while)..."
-  apt-get install -y ubuntu-desktop-minimal xrdp
+  msg "Installing Ubuntu Desktop + xRDP + SPICE guest tools (takes a while)..."
+  apt-get install -y ubuntu-desktop-minimal xrdp spice-vdagent
   systemctl enable --now xrdp
   # GUI-Autostart beim grafischen Login (RDP/Konsole): holaOS Dev startet von selbst.
   # Der Auto-Install läuft als root, der Desktop-Login aber als GUI_USER (z.B. hola).
