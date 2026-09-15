@@ -32,6 +32,12 @@ WITH_DESKTOP=0
 SKIP_BUILD=0
 LOG_FILE="/var/log/holaos-install.log"
 
+# Owner bestimmen (CI-User bzw. SUDO_USER), damit bun/npm-Cache + Checkout die richtigen Rechte haben.
+OWNER_USER="${SUDO_USER:-root}"
+OWNER_HOME="$(getent passwd "$OWNER_USER" | cut -d: -f6)"
+[ -z "${OWNER_HOME:-}" ] && OWNER_HOME="$HOME"
+BUN_DIR="${OWNER_HOME}/.bun"
+
 NODE_VERSION="24.14.1"
 BUN_VERSION="1.3.6"
 
@@ -143,18 +149,20 @@ install_bun() {
     ok "bun already ok ($(bun --version))"
     return
   fi
-  msg "Installing bun ${BUN_VERSION}..."
-  curl -fsSL https://bun.sh/install | BUN_VERSION="${BUN_VERSION}" BUN_INSTALL="${HOME}/.bun" bash
-  ln -sf "${HOME}/.bun/bin/bun" /usr/local/bin/bun
-  ln -sf "${HOME}/.bun/bin/bunx" /usr/local/bin/bunx 2>/dev/null || true
-  export PATH="${HOME}/.bun/bin:${PATH}"
+  msg "Installing bun ${BUN_VERSION} for ${OWNER_USER} (${BUN_DIR})..."
+  mkdir -p "${BUN_DIR}"
+  curl -fsSL https://bun.sh/install | BUN_VERSION="${BUN_VERSION}" BUN_INSTALL="${BUN_DIR}" bash
+  ln -sf "${BUN_DIR}/bin/bun" /usr/local/bin/bun
+  ln -sf "${BUN_DIR}/bin/bunx" /usr/local/bin/bunx 2>/dev/null || true
+  if [ "$OWNER_USER" != "root" ]; then chown -R "${OWNER_USER}:${OWNER_USER}" "${BUN_DIR}"; fi
+  export PATH="${BUN_DIR}/bin:/usr/local/node-holaos/bin:${PATH}"
   ok "bun ready ($(bun --version))"
   if ! grep -q '.bun/bin' /etc/profile.d/holaos.sh 2>/dev/null; then
     echo 'export PATH="$HOME/.bun/bin:/usr/local/node-holaos/bin:$PATH"' > /etc/profile.d/holaos.sh
   fi
 }
 install_bun
-export PATH="${HOME}/.bun/bin:/usr/local/node-holaos/bin:${PATH}"
+export PATH="${BUN_DIR}/bin:/usr/local/node-holaos/bin:${PATH}"
 
 # ---------- 4. optional desktop (for Electron GUI) ----------
 if [ "${WITH_DESKTOP}" -eq 1 ]; then
@@ -190,12 +198,12 @@ if [ "${SKIP_BUILD}" -eq 1 ]; then
   exit 0
 fi
 
-# bun install must run as the owner (not root$nobody quirks) — run as SUDO_USER if present
+# bun install muss als Owner laufen (nicht root-nobody-quirks) — als SUDO_USER wenn vorhanden
 run_as_owner() {
   if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
-    sudo -u "${SUDO_USER}" -H env PATH="${HOME}/.bun/bin:/usr/local/node-holaos/bin:/usr/local/bin:/usr/bin:/bin" "$@"
+    sudo -u "${SUDO_USER}" -H env PATH="${BUN_DIR}/bin:/usr/local/node-holaos/bin:/usr/local/bin:/usr/bin:/bin" "$@"
   else
-    "$@"
+    env PATH="${BUN_DIR}/bin:/usr/local/node-holaos/bin:/usr/local/bin:/usr/bin:/bin" "$@"
   fi
 }
 

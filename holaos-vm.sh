@@ -20,7 +20,14 @@
 #   HOLAOS_REF=main          git ref installed inside the VM
 #   HOLAOS_WITH_DESKTOP=0    set to 1 to pass --with-desktop to guest installer
 
-source /dev/stdin <<<$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/api.func)
+# api.func (Community-Scripts) ist optional — Skript muss auch ohne Netz/API laufen.
+# Alle post_* Aufrufe sind daher best-effort (|| true) und per command -v abgesichert.
+if curl -fsSL --max-time 15 https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/api.func -o /tmp/holaos-api.func 2>/dev/null; then
+  # shellcheck disable=SC1091
+  source /tmp/holaos-api.func || true
+fi
+post_to_api_vm_safe() { command -v post_to_api_vm >/dev/null 2>&1 && post_to_api_vm || true; }
+post_update_to_api_safe() { command -v post_update_to_api >/dev/null 2>&1 && post_update_to_api "$@" || true; }
 
 HOLAOS_INSTALL_URL="${HOLAOS_INSTALL_URL:-https://raw.githubusercontent.com/HatchetMan111/HolaOS-Proxmox/main/holaos-install.sh}"
 HOLAOS_REF="${HOLAOS_REF:-main}"
@@ -59,17 +66,28 @@ DEFAULT="${TAB}⚙️${TAB}${CL}"; MACADDRESS="${TAB}🔗${TAB}${CL}"; VLANTAG="
 CREATING="${TAB}🚀${TAB}${CL}"; ADVANCED="${TAB}🧩${TAB}${CL}"
 
 THIN="discard=on,ssd=1,"
-set -e
+set -e -o pipefail
+VM_CREATED="no"
+CLEANUP_ON_ERROR="yes"
 trap 'error_handler $LINENO "$BASH_COMMAND"' ERR
 trap cleanup EXIT
-trap 'post_update_to_api "failed" "130"' SIGINT
-trap 'post_update_to_api "failed" "143"' SIGTERM
+trap 'post_update_to_api_safe "failed" "130"' SIGINT
+trap 'post_update_to_api_safe "failed" "143"' SIGTERM
 
 function error_handler() {
   local exit_code="$?"; local line_number="$1"; local command="$2"
-  post_update_to_api "failed" "$exit_code"
+  # ERR-Trap nicht für erwartete Fehlschläge in if/||-Kontexten feuern lassen:
+  # (bash ruft ERR bei `set -e` in Funktionen/Subshels trotzdem auf – daher hier filtern)
+  case "$command" in
+    *"post_update_to_api_safe"*|*"post_to_api_vm_safe"*) return 0 ;;
+  esac
+  post_update_to_api_safe "failed" "$exit_code"
   echo -e "\n${RD}[ERROR]${CL} line ${RD}$line_number${CL}: exit ${RD}$exit_code${CL}: ${YW}$command${CL}\n"
-  cleanup_vmid
+  if [[ "$VM_CREATED" == "yes" && "$CLEANUP_ON_ERROR" == "yes" ]]; then
+    cleanup_vmid
+  else
+    echo -e "${YW}VM bleibt erhalten (qm config $VMID / qm status $VMID prüfen).${CL}"
+  fi
 }
 function get_valid_nextid() {
   local try_id; try_id=$(pvesh get /cluster/nextid)
@@ -79,14 +97,51 @@ function get_valid_nextid() {
   done
   echo "$try_id"
 }
-function cleanup_vmid() { if qm status $VMID &>/dev/null; then qm stop $VMID &>/dev/null; qm destroy $VMID &>/dev/null; fi; }
+function cleanup_vmid() {
+  if [[ -z "${VMID:-}" ]]; then return 0; fi
+  if qm status "$VMID" &>/dev/null; then qm stop "$VMID" &>/dev/null || true; fi
+  # Nur zerstören, wenn die VM von diesem Skriptlauf erstellt wurde.
+  if [[ "$VM_CREATED" == "yes" ]]; then qm destroy "$VMID" --destroy-unreferenced-disks 1 &>/dev/null || qm destroy "$VMID" &>/dev/null || true; fi
+}
 function cleanup() {
   local exit_code=$?
   popd >/dev/null 2>&1 || true
   if [[ "${POST_TO_API_DONE:-}" == "true" && "${POST_UPDATE_DONE:-}" != "true" ]]; then
-    if [[ $exit_code -eq 0 ]]; then post_update_to_api "done" "none"; else post_update_to_api "failed" "$exit_code"; fi
+    if [[ $exit_code -eq 0 ]]; then post_update_to_api_safe "done" "none"; else post_update_to_api_safe "failed" "$exit_code"; fi
   fi
-  rm -rf "${TEMP_DIR:-}"
+  rm -rf "${TEMP_DIR:-}" /tmp/holaos-api.func 2>/dev/null || true
+}
+# Löst das Host-Verzeichnis für <store>:snippets/... robust auf.
+# `pvesm path <store>:snippets` ohne Dateiname schlägt fehl — deshalb mit Dummy-Datei arbeiten
+# und zusätzlich Storage-Config (/etc/pve/storage.cfg, pvesh) auswerten.
+# Echo: Verzeichnis (ohne trailing slash). Exit 1 wenn nicht ermittelbar.
+function get_snippets_dir() {
+  local store="$1" guess=""
+  # 1) pvesm path mit Dummy-Datei (prüft nichts, parst nur die Volume-ID)
+  guess="$(pvesm path "${store}:snippets/holaos-probe-dummy.yaml" 2>/dev/null || true)"
+  if [[ -n "$guess" ]]; then dirname "$guess"; return 0; fi
+  # 2) Storage-Pfad aus pvesh (dir/nfs/cifs: path + /snippets)
+  local base=""
+  base="$(pvesh get "/storage/${store}" 2>/dev/null | awk '$1=="path"{print $2}' | head -1 || true)"
+  if [[ -n "$base" && -d "$base" ]]; then echo "${base}/snippets"; return 0; fi
+  # 3) /etc/pve/storage.cfg parsen (dir: <store> ... path <pfad>)
+  base="$(awk -v s="$store" '
+    $1=="dir:" && $2==s {found=1; next}
+    found && $1=="path" {print $2; exit}
+    found && $1~/:$/ {exit}
+  ' /etc/pve/storage.cfg 2>/dev/null || true)"
+  if [[ -n "$base" ]]; then echo "${base}/snippets"; return 0; fi
+  # 4) Standard-lokal (NICHT template/snippets — das war der alte falsche Fallback!)
+  for cand in "/var/lib/vz/snippets" "/mnt/pve/${store}/snippets"; do
+    if [[ -d "$(dirname "$cand")" ]]; then echo "$cand"; return 0; fi
+  done
+  return 1
+}
+# Liefer den ersten Storage, der einen Content-Typ unterstützt (Komma-getrennt prüfen).
+function first_storage_with_content() {
+  local want="$1" s
+  s="$(pvesm status -content "$want" 2>/dev/null | awk 'NR>1 {print $1}' | head -1 || true)"
+  echo "$s"
 }
 TEMP_DIR=$(mktemp -d); pushd $TEMP_DIR >/dev/null
 
@@ -160,9 +215,11 @@ function advanced_settings() {
     [ -z "$RAM_SIZE" ] && RAM_SIZE="8192"
     echo -e "${RAMSIZE}${BOLD}${DGN}RAM: ${BGN}$RAM_SIZE${CL}"
   else exit-script; fi
-  if DS=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "Disk in GiB (min 20, empfohlen 40)" 8 58 40 --title "DISK" --cancel-button Exit 3>&1 1>&2 2>&3); then
-    DS=$(echo "$DS" | tr -d ' '); [[ "$DS" =~ ^[0-9]+G$ ]] || DS="${DS}G"
-    DISK_SIZE="$DS"; echo -e "${DISKSIZE}${BOLD}${DGN}Disk: ${BGN}$DISK_SIZE${CL}"
+  if DS_RAW=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "Disk in GiB (min 20, empfohlen 40)" 8 58 40 --title "DISK" --cancel-button Exit 3>&1 1>&2 2>&3); then
+    DS_NUM=$(echo "$DS_RAW" | tr -cd '0-9')
+    [ -z "$DS_NUM" ] && DS_NUM="40"
+    [ "$DS_NUM" -lt 20 ] && DS_NUM="20"
+    DISK_SIZE="${DS_NUM}G"; echo -e "${DISKSIZE}${BOLD}${DGN}Disk: ${BGN}$DISK_SIZE${CL}"
   else exit-script; fi
   if BRG=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "Bridge" 8 58 vmbr0 --title "BRIDGE" --cancel-button Exit 3>&1 1>&2 2>&3); then
     [ -z "$BRG" ] && BRG="vmbr0"; echo -e "${BRIDGE}${BOLD}${DGN}Bridge: ${BGN}$BRG${CL}"
@@ -189,7 +246,13 @@ function start_script() {
 }
 
 check_root; arch_check; pve_check; ssh_check; start_script
-post_to_api_vm
+post_to_api_vm_safe
+
+# Bridge existiert?
+if ! ip link show "$BRG" &>/dev/null; then
+  msg_error "Bridge ${BRG} existiert nicht (ip link). Bitte vmbrX prüfen."
+  exit 104
+fi
 
 # ---------- storage ----------
 msg_info "Validating storage"
@@ -229,41 +292,83 @@ for i in 0 1; do disk="DISK$i"; eval DISK${i}=vm-${VMID}-disk-${i}${DISK_EXT:-};
 
 # ---------- create VM ----------
 msg_info "Creating holaOS VM"
-qm create $VMID -agent 1${MACHINE} -tablet 0 -localtime 1 -bios ovmf${CPU_TYPE} -cores $CORE_COUNT -memory $RAM_SIZE \
-  -name $HN -tags community-script,holaos -net0 virtio,bridge=$BRG,macaddr=$MAC$VLAN$MTU -onboot 1 -ostype l26 -scsihw virtio-scsi-pci
-pvesm alloc $STORAGE $VMID $DISK0 4M 1>&/dev/null
-qm importdisk $VMID ${FILE} $STORAGE ${DISK_IMPORT:-} 1>&/dev/null
-qm set $VMID -efidisk0 ${DISK0_REF}${FORMAT} -scsi0 ${DISK1_REF},${DISK_CACHE}${THIN}size=${DISK_SIZE} \
-  -ide2 ${STORAGE}:cloudinit -boot order=scsi0 -serial0 socket >/dev/null
+qm create "$VMID" -agent 1"${MACHINE}" -tablet 0 -localtime 1 -bios ovmf"${CPU_TYPE}" -cores "$CORE_COUNT" -memory "$RAM_SIZE" \
+  -name "$HN" -tags community-script,holaos -net0 virtio,bridge="$BRG",macaddr="$MAC$VLAN$MTU" -onboot 1 -ostype l26 -scsihw virtio-scsi-pci
+VM_CREATED="yes"
+pvesm alloc "$STORAGE" "$VMID" "$DISK0" 4M 1>&/dev/null
+qm importdisk "$VMID" "${FILE}" "$STORAGE" ${DISK_IMPORT:-} 1>&/dev/null
+# CloudInit-Drive: bevorzugt auf dem gewählten Storage, sonst erster Storage mit cloudinit-Content.
+CLOUDINIT_STORE="$STORAGE"
+if ! pvesm status -content cloudinit 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$STORAGE"; then
+  FALLBACK_CI="$(first_storage_with_content cloudinit)"
+  if [[ -n "$FALLBACK_CI" ]]; then
+    msg_error "Storage $STORAGE ohne cloudinit-Content — nutze $FALLBACK_CI für CloudInit-Drive"
+    CLOUDINIT_STORE="$FALLBACK_CI"
+  fi
+fi
+if ! qm set "$VMID" -efidisk0 "${DISK0_REF}${FORMAT}" -scsi0 "${DISK1_REF},${DISK_CACHE}${THIN}size=${DISK_SIZE}" \
+  -ide2 "${CLOUDINIT_STORE}:cloudinit" -boot order=scsi0 -serial0 socket >/dev/null; then
+  msg_error "qm set (disks/cloudinit) failed — versuche CloudInit auf Alternativ-Storage"
+  FALLBACK_CI="$(first_storage_with_content cloudinit)"
+  if [[ -n "$FALLBACK_CI" && "$FALLBACK_CI" != "$CLOUDINIT_STORE" ]]; then
+    CLOUDINIT_STORE="$FALLBACK_CI"
+    qm set "$VMID" -efidisk0 "${DISK0_REF}${FORMAT}" -scsi0 "${DISK1_REF},${DISK_CACHE}${THIN}size=${DISK_SIZE}" \
+      -ide2 "${CLOUDINIT_STORE}:cloudinit" -boot order=scsi0 -serial0 socket >/dev/null
+  else
+    exit 1
+  fi
+fi
 
 # ---------- cloud-init user/net ----------
 CI_PASS="$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 12)"
-qm set $VMID --ciuser "${CI_USER}" --cipassword "${CI_PASS}" --ipconfig0 ip=dhcp --ciupgrade 0 >/dev/null
+qm set "$VMID" --ciuser "${CI_USER}" --cipassword "${CI_PASS}" --ipconfig0 ip=dhcp --ciupgrade 0 >/dev/null
 msg_ok "Cloud-Init: user=${CL}${BL}${CI_USER}${CL} / DHCP / qemu-agent on"
 
 # ---------- vendor snippet for auto-install ----------
+# FIX für: "volume 'local:snippets/holaos-...-vendor.yaml' does not exist" bei `qm start`:
+# Ursache war `pvesm path <store>:snippets` (ohne Datei -> Fehler) + falscher Fallback
+# /var/lib/vz/template/snippets (richtig: /var/lib/vz/snippets). Datei landete im falschen
+# Verzeichnis, `qm set --cicustom` gab trotzdem 0 zurück, erst `qm start` schlug fehl und
+# der ERR-Trap hat danach die VM gelöscht. Jetzt: korrekte Pfadauflösung + Verifikation
+# VOR dem Start + Retry ohne cicustom statt VM-Verlust.
 SNIPPET_OK="no"
+VENDOR_VOLID=""
 if [ "${AUTOINSTALL}" == "yes" ]; then
-  SNIP_STORE="$(pvesm status -content snippets 2>/dev/null | awk 'NR>1 {print $1}' | head -1)"
+  SNIP_STORE="$(first_storage_with_content snippets)"
   if [ -n "${SNIP_STORE:-}" ]; then
-    SNIP_PATH="$(pvesm path ${SNIP_STORE}:snippets 2>/dev/null || echo "/var/lib/vz/template/snippets")"
-    mkdir -p "${SNIP_PATH}"
-    VENDOR_FILE="${SNIP_PATH}/holaos-${VMID}-vendor.yaml"
-    EXTRA_ARGS=""
-    [ "${HOLAOS_WITH_DESKTOP}" == "1" ] && EXTRA_ARGS="--with-desktop"
-    cat > "${VENDOR_FILE}" <<EOF
+    if SNIP_PATH="$(get_snippets_dir "$SNIP_STORE")"; then
+      mkdir -p "${SNIP_PATH}"
+      VENDOR_FILE="${SNIP_PATH}/holaos-${VMID}-vendor.yaml"
+      EXTRA_ARGS=""
+      [ "${HOLAOS_WITH_DESKTOP}" == "1" ] && EXTRA_ARGS=" --with-desktop"
+      cat > "${VENDOR_FILE}" <<EOF
 #cloud-config
 package_update: true
+package_upgrade: false
 packages: [curl, ca-certificates, qemu-guest-agent]
 runcmd:
-  - [ systemctl, enable, --now, qemu-guest-agent ]
-  - [ bash, -c, "curl -fsSL ${HOLAOS_INSTALL_URL} -o /root/holaos-install.sh && bash /root/holaos-install.sh --ref ${HOLAOS_REF} ${EXTRA_ARGS} 2>&1 | tee /var/log/holaos-install.log" ]
+  - systemctl enable --now qemu-guest-agent
+  - curl -fsSL ${HOLAOS_INSTALL_URL} -o /root/holaos-install.sh
+  - bash /root/holaos-install.sh --ref ${HOLAOS_REF}${EXTRA_ARGS}
 EOF
-    if qm set $VMID --cicustom "vendor=${SNIP_STORE}:snippets/holaos-${VMID}-vendor.yaml" >/dev/null 2>&1; then
-      SNIPPET_OK="yes"
-      msg_ok "Auto-install via ${CL}${BL}${SNIP_STORE}:snippets/holaos-${VMID}-vendor.yaml${CL}"
+      chmod 0644 "${VENDOR_FILE}"
+      VENDOR_VOLID="${SNIP_STORE}:snippets/holaos-${VMID}-vendor.yaml"
+      # Verifizieren: Datei liegt wirklich da UND pvesm kennt das Volume.
+      if [[ -f "$VENDOR_FILE" ]] \
+        && pvesm list "$SNIP_STORE" 2>/dev/null | grep -q "holaos-${VMID}-vendor.yaml" \
+        && pvesm path "$VENDOR_VOLID" >/dev/null 2>&1 \
+        && qm set "$VMID" --cicustom "vendor=${VENDOR_VOLID}" >/dev/null 2>&1 \
+        && qm config "$VMID" 2>/dev/null | grep -q "cicustom:.*${VENDOR_VOLID}"; then
+        SNIPPET_OK="yes"
+        msg_ok "Auto-install via ${CL}${BL}${VENDOR_VOLID}${CL}"
+      else
+        msg_error "cicustom-Verifikation fehlgeschlagen — fahre ohne vendor fort (manuell installieren)"
+        qm set "$VMID" --delete cicustom >/dev/null 2>&1 || qm set "$VMID" --cicustom "" >/dev/null 2>&1 || true
+        rm -f "$VENDOR_FILE" || true
+        VENDOR_VOLID=""; SNIPPET_OK="no"
+      fi
     else
-      msg_error "cicustom failed — manual install needed"
+      msg_error "Snippets-Pfad für ${SNIP_STORE} nicht auflösbar — skipping auto-install"
     fi
   else
     msg_error "No snippets storage — skipping auto-install (manual step below)"
@@ -279,12 +384,37 @@ DESCRIPTION=$(cat <<EOF
 </div>
 EOF
 )
-qm set $VMID -description "$DESCRIPTION" >/dev/null
-qm resize $VMID scsi0 ${DISK_SIZE} >/dev/null
+qm set "$VMID" -description "$DESCRIPTION" >/dev/null
+# Hinweis: scsi0 wurde oben bereits mit size=${DISK_SIZE} angelegt — kein qm resize nötig.
+# (Ein erneutes `qm resize ... ${DISK_SIZE}` auf dieselbe Größe schlägt fehl.)
 msg_ok "Created holaOS VM ${CL}${BL}(${HN}, #${VMID})${CL}"
 
-if [ "$START_VM" == "yes" ]; then msg_info "Starting VM"; qm start $VMID; msg_ok "Started"; fi
-post_update_to_api "done" "none"
+if [ "$START_VM" == "yes" ]; then
+  msg_info "Starting VM"
+  # Ab hier VM nicht mehr bei Fehlern löschen — lieber retten als zerstören.
+  CLEANUP_ON_ERROR="no"
+  set +e
+  trap - ERR
+  qm start "$VMID"
+  START_RC=$?
+  if [[ $START_RC -ne 0 && "$SNIPPET_OK" == "yes" ]]; then
+    msg_error "Start mit vendor-Snippet fehlgeschlagen (RC $START_RC) — entferne cicustom und starte erneut"
+    qm set "$VMID" --delete cicustom >/dev/null 2>&1 || qm set "$VMID" --cicustom "" >/dev/null 2>&1 || true
+    SNIPPET_OK="no"
+    qm start "$VMID"
+    START_RC=$?
+  fi
+  # ERR-Trap wieder scharf (aber Cleanup bleibt aus — VM erhalten).
+  trap 'error_handler $LINENO "$BASH_COMMAND"' ERR
+  set -e
+  if [[ $START_RC -ne 0 ]]; then
+    msg_error "qm start failed (RC $START_RC). VM bleibt erhalten: qm config $VMID / qm start $VMID"
+    post_update_to_api_safe "failed" "$START_RC"
+  else
+    msg_ok "Started"
+  fi
+fi
+post_update_to_api_safe "done" "none"
 msg_ok "Done!\n"
 echo -e " ── holaOS Zugang ─────────────────────────────────────"
 echo -e " VMID:      $VMID   Hostname: $HN"
