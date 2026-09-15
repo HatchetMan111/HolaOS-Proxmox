@@ -83,6 +83,11 @@ if [ "$(id -u)" -ne 0 ]; then
   fail "Please run as root (use sudo): curl ... | sudo bash"
 fi
 
+# Cloud-Init runcmd startet mit minimalem Environment (kein HOME/USER) — mit `set -u`
+# knallt sonst jedes ${HOME} (auch im bun-Upstream-Installer). Daher hier auffüllen.
+export HOME="${HOME:-/root}"
+export USER="${USER:-root}"
+
 mkdir -p "$(dirname "${LOG_FILE}")"
 touch "${LOG_FILE}"
 exec > >(tee -a "${LOG_FILE}") 2>&1
