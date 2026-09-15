@@ -143,6 +143,36 @@ function first_storage_with_content() {
   s="$(pvesm status -content "$want" 2>/dev/null | awk 'NR>1 {print $1}' | head -1 || true)"
   echo "$s"
 }
+# Erste globale IPv4 der VM via QEMU Guest Agent (echo IP, RC 1 wenn noch keine).
+function get_vm_ip() {
+  local vmid="$1" out="$2" ip=""
+  if [[ -z "$out" ]]; then out="$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null || true)"; fi
+  [[ -z "$out" ]] && return 1
+  if command -v python3 >/dev/null 2>&1; then
+    ip="$(echo "$out" | python3 -c '
+import json,sys
+try:
+  data = json.load(sys.stdin)
+except Exception:
+  sys.exit(1)
+ips = []
+if isinstance(data, dict):
+  data = data.get("result", data)
+items = data if isinstance(data, list) else []
+for iface in items:
+  for a in (iface.get("ip-addresses", []) or []):
+    ip = a.get("ip-address", "")
+    if a.get("ip-address-type", "") == "ipv4" and ip and not ip.startswith("127.") and not ip.startswith("169.254."):
+      print(ip)
+      sys.exit(0)
+sys.exit(1)
+' 2>/dev/null || true)"
+  else
+    ip="$(echo "$out" | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | grep -v '^127\.' | grep -v '^169\.254\.' | head -1 || true)"
+  fi
+  [[ -n "$ip" ]] && echo "$ip" && return 0
+  return 1
+}
 TEMP_DIR=$(mktemp -d); pushd $TEMP_DIR >/dev/null
 
 if whiptail --backtitle "Proxmox VE Helper Scripts" --title "holaOS VM" \
@@ -416,10 +446,38 @@ if [ "$START_VM" == "yes" ]; then
 fi
 post_update_to_api_safe "done" "none"
 msg_ok "Done!\n"
-echo -e " ── holaOS Zugang ─────────────────────────────────────"
+# ---------- Abschluss-Check: IP + Erreichbarkeit, damit man sieht ob es sauber durchlief ----------
+VM_IP=""; AGENT_STATE="unbekannt"
+if [[ "${START_VM}" == "yes" && "${START_RC:-1}" -eq 0 ]]; then
+  msg_info "Warte auf VM-IP (Guest Agent/DHCP, max ~2 Min)"
+  for _try in $(seq 1 24); do
+    if VM_IP="$(get_vm_ip "$VMID")"; then break; fi
+    sleep 5
+  done
+  if [[ -n "$VM_IP" ]]; then msg_ok "VM-IP: ${CL}${BL}${VM_IP}${CL}"; AGENT_STATE="ok";
+  else msg_error "Noch keine VM-IP (Agent/DHCP braucht noch) — unten Fallback prüfen"; AGENT_STATE="pending"; fi
+fi
+PVE_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+[[ -z "$PVE_IP" ]] && PVE_IP="<PVE-IP>"
+echo -e " ── holaOS Ergebnis ───────────────────────────────────"
+if [[ "${START_VM}" == "yes" && "${START_RC:-1}" -eq 0 && -n "$VM_IP" ]]; then
+  echo -e " Status:    ✅ GESTARTET, sauber durchgelaufen (Agent: ok, IP: $VM_IP)"
+elif [[ "${START_VM}" == "yes" && "${START_RC:-1}" -eq 0 ]]; then
+  echo -e " Status:    ⚠️  GESTARTET, aber IP noch pending (Agent: $AGENT_STATE)"
+  echo -e " Prüfen:   qm status $VMID && qm guest cmd $VMID network-get-interfaces"
+else
+  echo -e " Status:    ⏸️  NICHT gestartet (START_VM=$START_VM) — manuell: qm start $VMID"
+fi
 echo -e " VMID:      $VMID   Hostname: $HN"
 echo -e " CI-User:   ${CI_USER}   Passwort: ${CI_PASS}  (bitte notieren!)"
-echo -e " SSH:       ssh ${CI_USER}@<VM-IP>  (IP: qm guest cmd $VMID network-get-interfaces)"
+if [[ -n "$VM_IP" ]]; then
+  echo -e " VM-IP:     $VM_IP"
+  echo -e " SSH:       ssh ${CI_USER}@${VM_IP}"
+  echo -e " Web/Oberfläche (Proxmox): https://${PVE_IP}:8006 → VM $VMID → Konsole"
+else
+  echo -e " SSH:       ssh ${CI_USER}@<VM-IP>  (IP holen: qm guest cmd $VMID network-get-interfaces)"
+  echo -e " Web/Oberfläche (Proxmox): https://${PVE_IP}:8006 → VM $VMID → Konsole"
+fi
 if [ "$SNIPPET_OK" == "yes" ]; then
   echo -e " Auto-Install: LÄUFT beim ersten Boot (~10-20 Min). Log in der VM:"
   echo -e "   tail -f /var/log/holaos-install.log  /  cloud-init status --wait"
