@@ -119,12 +119,50 @@ else
 fi
 
 # ---------- 0b. Plattenplatz (früh und verständlich scheitern, nicht mitten im Build) ----------
+# Das Cloud-Image ist ~2-3 GB; `qm resize` wächst das Volume, aber die Partition
+# folgt erst via cloud-init growpart. Falls / noch klein ist, hier selbst nachhelfen,
+# statt kommentarlos mit ENOSPC mitten im bun-Install zu sterben (dann bliebe auch :7680 tot).
 REQ_GB=10
+try_grow_root() {
+  command -v growpart >/dev/null 2>&1 || apt-get install -y --no-install-recommends cloud-guest-utils 2>/dev/null || true
+  local root_src root_disk root_part
+  root_src="$(findmnt -no SOURCE / 2>/dev/null || true)"
+  # sda1/vda1 -> disk=/dev/sda part=1 ; nvme0n1p2 -> disk=/dev/nvme0n1 part=2
+  # (Vorsicht: kein && mit zweitem =~ in EINEM [[ ]], das überschreibt BASH_REMATCH.)
+  if [[ "$root_src" =~ ^(.*)p([0-9]+)$ ]]; then
+    _pre="${BASH_REMATCH[1]}"; _post="${BASH_REMATCH[2]}"
+    if [[ "$_pre" =~ [0-9]$ ]]; then
+      root_disk="$_pre"; root_part="$_post"
+    fi
+  fi
+  if [[ -z "${root_disk:-}" ]] && [[ "$root_src" =~ ^(/dev/[a-zA-Z]+)([0-9]+)$ ]]; then
+    root_disk="${BASH_REMATCH[1]}"; root_part="${BASH_REMATCH[2]}"
+  fi
+  [[ -z "${root_disk:-}" ]] && return 0
+  if [ -b "$root_disk" ]; then
+    growpart "$root_disk" "$root_part" 2>/dev/null || true
+    # Partitionsdevice korrekt zusammensetzen (nvme braucht p-Trenner, sda nicht)
+    if [ -b "${root_disk}p${root_part}" ]; then
+      resize2fs "${root_disk}p${root_part}" 2>/dev/null || true
+    elif [ -b "${root_disk}${root_part}" ]; then
+      resize2fs "${root_disk}${root_part}" 2>/dev/null || true
+    else
+      resize2fs "$root_src" 2>/dev/null || true
+    fi
+  fi
+}
 AVAIL_KB="$(df -k / | awk 'NR==2 {print $4}')"
+if [ "${AVAIL_KB:-0}" -lt $((REQ_GB*1024*1024)) ]; then
+  warn "Wenig Platz auf / ($((AVAIL_KB/1024/1024))G frei) — versuche growpart/resize2fs..."
+  try_grow_root
+  AVAIL_KB="$(df -k / | awk 'NR==2 {print $4}')"
+fi
 if [ "${AVAIL_KB:-0}" -lt $((REQ_GB*1024*1024)) ]; then
   fail "Zu wenig Platz auf / ($((AVAIL_KB/1024/1024))G frei, ${REQ_GB}G nötig). Auf dem Proxmox-Host: qm resize <VMID> scsi0 +20G — in der VM: growpart /dev/sda 1 && resize2fs /dev/sda1"
 fi
 ok "Plattenplatz ok ($((AVAIL_KB/1024/1024))G frei auf /)"
+# Install-Log für den Webterminal-User lesbar machen (Login als VM-User, nicht root).
+chmod 644 "${LOG_FILE}" 2>/dev/null || true
 
 # ---------- 1. system packages ----------
 msg "Installing system packages (git, curl, build tools)..."
@@ -197,11 +235,76 @@ install_bun() {
 install_bun
 export PATH="${BUN_DIR}/bin:/usr/local/node-holaos/bin:${PATH}"
 
-# ---------- 4. optional desktop (for Electron GUI) ----------
+# ---------- 4. optional web terminal (ttyd on :7680 with system login) ----------
+# ABSICHTLICH VOR Desktop/Build: der Desktop-Install + bun-Build dauern 15-30 Min.
+# ttyd ist nach ~1 Min da — sonst wirkt die VM "tot" (kein :7680), obwohl sie arbeitet.
+if [ "${WITH_WEBTERM}" -eq 1 ]; then
+  msg "Installing ttyd web terminal (port 7680, login with VM user account)..."
+  if ! command -v ttyd >/dev/null 2>&1; then
+    if apt-get install -y ttyd 2>/dev/null; then
+      ok "ttyd installed via apt"
+    else
+      TTYD_VER="1.7.7"; TTYD_ARCH=""
+      case "$(uname -m)" in
+        x86_64|amd64) TTYD_ARCH="x86_64" ;;
+        arm64|aarch64) TTYD_ARCH="aarch64" ;;
+        *) fail "Unsupported architecture for ttyd: $(uname -m)" ;;
+      esac
+      curl -fsSL --retry 5 --retry-delay 5 -o /usr/local/bin/ttyd "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VER}/ttyd.${TTYD_ARCH}"
+      chmod +x /usr/local/bin/ttyd
+      ok "ttyd ${TTYD_VER} installed to /usr/local/bin/ttyd"
+    fi
+  else
+    ok "ttyd already installed"
+  fi
+  TTYD_BIN="$(command -v ttyd)"
+  # /bin/login absolut: systemd hat minimales PATH; `login` allein startet sonst nicht.
+  # -i 0.0.0.0: auf allen Interfaces lauschen (nicht nur lo) — sonst ist :7680 vom LAN tot.
+  cat > /etc/systemd/system/ttyd.service <<EOF
+[Unit]
+Description=ttyd web terminal (holaOS)
+After=network-online.target
+Wants=network-online.target
+[Service]
+User=root
+ExecStart=${TTYD_BIN} --writable -i 0.0.0.0 -p 7680 /bin/login
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable ttyd >/dev/null 2>&1 || true
+  # restart statt nur start: ein fremder/laufender ttyd (z.B. apt-Default auf lo:7681)
+  # würde sonst mit falschen Args weiterlaufen.
+  systemctl restart ttyd
+  # UFW ist auf Cloud-Images meist inaktiv — falls doch aktiv, Ports freigeben.
+  ufw allow 7680/tcp 2>/dev/null || true
+  ufw allow 3389/tcp 2>/dev/null || true
+  ufw allow 22/tcp 2>/dev/null || true
+  sleep 2
+  if ss -ltn 2>/dev/null | grep -q ':7680 '; then
+    ok "Web terminal ready: http://<VM-IP>:7680 (login with VM user account)"
+  else
+    warn "ttyd aktiv, aber Port 7680 lauscht nicht — journalctl -u ttyd prüfen"
+    systemctl status ttyd --no-pager | head -8 || true
+  fi
+fi
+
+# ---------- 4b. optional desktop (for Electron GUI) ----------
 if [ "${WITH_DESKTOP}" -eq 1 ]; then
   msg "Installing Ubuntu Desktop + xRDP + SPICE guest tools (takes a while)..."
   apt-get install -y ubuntu-desktop-minimal xrdp spice-vdagent
+  # Ubuntu 24.04 default ist Wayland (GNOME) — xrdp kann nur Xorg. Ohne diesen Fix
+  # bleibt :3389 schwarz bzw. der Login scheitert, obwohl der Port offen ist.
+  if [ -f /etc/gdm3/custom.conf ]; then
+    sed -i 's/^#\?WaylandEnable=.*/WaylandEnable=false/' /etc/gdm3/custom.conf
+    grep -q '^WaylandEnable=' /etc/gdm3/custom.conf || echo 'WaylandEnable=false' >> /etc/gdm3/custom.conf
+  fi
+  adduser xrdp ssl-cert 2>/dev/null || true
   systemctl enable --now xrdp
+  systemctl restart xrdp 2>/dev/null || true
+  ufw allow 3389/tcp 2>/dev/null || true
   # GUI-Autostart beim grafischen Login (RDP/Konsole): holaOS Dev startet von selbst.
   # Der Auto-Install läuft als root, der Desktop-Login aber als GUI_USER (z.B. hola).
   AUTOSTART_USER="${GUI_USER:-$OWNER_USER}"
@@ -223,53 +326,6 @@ EOF
   else
     warn "Desktop installiert, aber kein GUI-User (root) — Autostart übersprungen, nutze --gui-user NAME"
     ok "Desktop ready — connect via SPICE console or RDP"
-  fi
-fi
-
-# ---------- 4b. optional web terminal (ttyd on :7680 with system login) ----------
-if [ "${WITH_WEBTERM}" -eq 1 ]; then
-  msg "Installing ttyd web terminal (port 7680, login with VM user account)..."
-  if ! command -v ttyd >/dev/null 2>&1; then
-    if apt-get install -y ttyd 2>/dev/null; then
-      ok "ttyd installed via apt"
-    else
-      TTYD_VER="1.7.7"; TTYD_ARCH=""
-      case "$(uname -m)" in
-        x86_64|amd64) TTYD_ARCH="x86_64" ;;
-        arm64|aarch64) TTYD_ARCH="aarch64" ;;
-        *) fail "Unsupported architecture for ttyd: $(uname -m)" ;;
-      esac
-      curl -fsSL -o /usr/local/bin/ttyd "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VER}/ttyd.${TTYD_ARCH}"
-      chmod +x /usr/local/bin/ttyd
-      ok "ttyd ${TTYD_VER} installed to /usr/local/bin/ttyd"
-    fi
-  else
-    ok "ttyd already installed"
-  fi
-  TTYD_BIN="$(command -v ttyd)"
-  cat > /etc/systemd/system/ttyd.service <<EOF
-[Unit]
-Description=ttyd web terminal (holaOS)
-After=network-online.target
-Wants=network-online.target
-[Service]
-ExecStart=${TTYD_BIN} --writable -p 7680 login
-Restart=always
-RestartSec=3
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  systemctl enable ttyd >/dev/null 2>&1 || true
-  # restart statt nur start: ein fremder/laufender ttyd (z.B. apt-Default auf lo:7681)
-  # würde sonst mit falschen Args weiterlaufen.
-  systemctl restart ttyd
-  sleep 2
-  if ss -ltn 2>/dev/null | grep -q ':7680 '; then
-    ok "Web terminal ready: http://<VM-IP>:7680 (login with VM user account)"
-  else
-    warn "ttyd aktiv, aber Port 7680 lauscht nicht — journalctl -u ttyd prüfen"
-    systemctl status ttyd --no-pager | head -8 || true
   fi
 fi
 
@@ -334,6 +390,25 @@ run_as_owner npm run desktop:typecheck
 ok "Typecheck passed"
 
 # ---------- 9. done ----------
+# Status-Helfer: zeigt ohne RDP/SSH-Rätselraten, wie weit der Auto-Install ist.
+# Aufruf in der VM (auch via Webterminal :7680):  holaos-status
+cat > /usr/local/bin/holaos-status <<EOF
+#!/usr/bin/env bash
+echo "--- holaOS status ---"
+echo "dir: ${INSTALL_DIR}  ref: ${REF}"
+systemctl is-active --quiet ttyd 2>/dev/null && echo "ttyd (:7680): aktiv" || echo "ttyd (:7680): INAKTIV (systemctl status ttyd)"
+ss -ltn 2>/dev/null | grep -q ':7680 ' && echo "port 7680: LAUSCHT" || echo "port 7680: ZU"
+if [ "${WITH_DESKTOP}" -eq 1 ]; then
+  systemctl is-active --quiet xrdp 2>/dev/null && echo "xrdp (:3389): aktiv" || echo "xrdp (:3389): INAKTIV"
+  ss -ltn 2>/dev/null | grep -q ':3389 ' && echo "port 3389: LAUSCHT" || echo "port 3389: ZU"
+fi
+[ -d "${INSTALL_DIR}/.git" ] && echo "checkout: vorhanden" || echo "checkout: fehlt (Build läuft noch oder fehlgeschlagen)"
+echo "--- install-log (letzte 15 Zeilen) ---"
+tail -n 15 "${LOG_FILE}" 2>/dev/null || echo "(kein Log)"
+EOF
+chmod +x /usr/local/bin/holaos-status
+echo "DONE $(date -u +%FT%TZ) dir=${INSTALL_DIR} ref=${REF}" > /var/log/holaos-status 2>/dev/null || true
+chmod 644 /var/log/holaos-status 2>/dev/null || true
 cat > /etc/motd <<EOF
 
   _          _        ___  ____

@@ -176,6 +176,20 @@ sys.exit(1)
   [[ -n "$ip" ]] && echo "$ip" && return 0
   return 1
 }
+# Port-Check ohne nc-Abhängigkeit: Proxmox-Hosts haben nicht immer netcat.
+# Nutzt bash-/dev/tcp mit timeout, fällt auf nc zurück wenn vorhanden.
+function port_open() {
+  local host="$1" port="$2"
+  if command -v timeout >/dev/null 2>&1; then
+    if timeout 3 bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" 2>/dev/null; then return 0; fi
+  else
+    if bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" 2>/dev/null; then return 0; fi
+  fi
+  if command -v nc >/dev/null 2>&1; then
+    if nc -z -w 3 "$host" "$port" 2>/dev/null; then return 0; fi
+  fi
+  return 1
+}
 TEMP_DIR=$(mktemp -d); pushd $TEMP_DIR >/dev/null
 
 if whiptail --backtitle "Proxmox VE Helper Scripts" --title "holaOS VM" \
@@ -211,11 +225,12 @@ function exit-script() { clear; echo -e "\n${CROSS}${RD}User exited${CL}\n"; exi
 function default_settings() {
   VMID=$(get_valid_nextid); FORMAT=",efitype=4m"; MACHINE=""; DISK_SIZE="40G"
   DISK_CACHE=""; HN="holaos"; CPU_TYPE=""; CORE_COUNT="4"; RAM_SIZE="8192"
+  CPU_MODEL="x86-64-v3"
   BRG="vmbr0"; MAC="$GEN_MAC"; VLAN=""; MTU=""; START_VM="yes"
   CI_USER="hola"; CI_SSHKEY="${HOLAOS_SSH_PUBKEY:-}"; AUTOINSTALL="yes"; METHOD="default"
   echo -e "${CONTAINERID}${BOLD}${DGN}VM ID: ${BGN}${VMID}${CL}"
   echo -e "${HOSTNAME}${BOLD}${DGN}Hostname: ${BGN}${HN}${CL}"
-  echo -e "${CPUCORE}${BOLD}${DGN}CPU: ${BGN}${CORE_COUNT} (KVM64)${CL}"
+  echo -e "${CPUCORE}${BOLD}${DGN}CPU: ${BGN}${CORE_COUNT} (${CPU_MODEL})${CL}"
   echo -e "${RAMSIZE}${BOLD}${DGN}RAM: ${BGN}${RAM_SIZE} MiB${CL}"
   echo -e "${DISKSIZE}${BOLD}${DGN}Disk: ${BGN}${DISK_SIZE}${CL}"
   echo -e "${BRIDGE}${BOLD}${DGN}Bridge: ${BGN}${BRG}${CL}"
@@ -282,6 +297,9 @@ function advanced_settings() {
   if (whiptail --backtitle "Proxmox VE Helper Scripts" --title "START VM" --yesno "VM nach Erstellung starten?" 10 58); then START_VM="yes"; else START_VM="no"; fi
   echo -e "${GATEWAY}${BOLD}${DGN}Start: ${BGN}$START_VM${CL}"
   FORMAT=",efitype=4m"; MACHINE=""; DISK_CACHE=""; CPU_TYPE=""; MAC="$GEN_MAC"; VLAN=""; MTU=""
+  # AVX2-Pflicht (bun + Electron): kvm64-Default würde mit `Illegal instruction`
+  # bzw. 100-%-Loop sterben — s. README "Voraussetzungen (Hardware)".
+  CPU_MODEL="${CPU_MODEL:-x86-64-v3}"
   if (whiptail --backtitle "Proxmox VE Helper Scripts" --title "READY" --yesno "holaOS VM jetzt erstellen?" --no-button Do-Over 10 58); then
     echo -e "${CREATING}${BOLD}${DGN}Creating holaOS VM (advanced)${CL}"
   else header_info; echo -e "${ADVANCED}${BOLD}${RD}Advanced${CL}"; advanced_settings; fi
@@ -344,7 +362,8 @@ msg_info "Creating holaOS VM"
 # (mit spice-vdagent im Gast, installiert der Installer bei --with-desktop).
 VGA_OPT=""
 if [ "${HOLAOS_WITH_DESKTOP}" == "1" ]; then VGA_OPT="-vga qxl"; fi
-qm create "$VMID" -agent 1"${MACHINE}" -tablet 0 -localtime 1 -bios ovmf"${CPU_TYPE}" -cores "$CORE_COUNT" -memory "$RAM_SIZE" \
+  qm create "$VMID" -agent 1"${MACHINE}" -tablet 0 -localtime 1 -bios ovmf"${CPU_TYPE}" -cores "$CORE_COUNT" -memory "$RAM_SIZE" \
+  -cpu "cputype=${CPU_MODEL:-x86-64-v3}" \
   -name "$HN" -tags community-script,holaos -net0 virtio,bridge="$BRG",macaddr="$MAC$VLAN$MTU" -onboot 1 -ostype l26 -scsihw virtio-scsi-pci ${VGA_OPT}
 VM_CREATED="yes"
 pvesm alloc "$STORAGE" "$VMID" "$DISK0" 4M 1>&/dev/null
@@ -418,7 +437,7 @@ ssh_pwauth: true
 packages: [curl, ca-certificates, qemu-guest-agent, openssh-server]
 runcmd:
   - systemctl enable --now qemu-guest-agent
-  - curl -fsSL ${HOLAOS_INSTALL_URL} -o /root/holaos-install.sh
+  - curl -fsSL --retry 5 --retry-delay 5 ${HOLAOS_INSTALL_URL} -o /root/holaos-install.sh
   - bash /root/holaos-install.sh --ref ${HOLAOS_REF}${EXTRA_ARGS}
 EOF
       chmod 0644 "${VENDOR_FILE}"
@@ -445,16 +464,14 @@ EOF
   fi
 fi
 
-DESCRIPTION=$(cat <<EOF
-<div align='center'>
-  <h2>holaOS VM (${HN})</h2>
-  <p>Ubuntu 24.04 + <a href='https://github.com/holaboss-ai/holaOS'>holaboss-ai/holaOS</a></p>
-  <p>Inside the VM: <code>curl -fsSL ${HOLAOS_INSTALL_URL} | sudo bash</code></p>
-  <p>Then: <code>cd ~/holaboss-ai && npm run desktop:dev</code> (needs display)</p>
-</div>
-EOF
-)
-qm set "$VMID" -description "$DESCRIPTION" >/dev/null
+# Einzeilige Beschreibung: mehrzeiliges HTML + Single-Quotes haben auf manchen
+# PVE-Versionen `400 not enough arguments` + `qm set <vmid> [OPTIONS]` auf stderr
+# geworfen. Absichtlich best-effort (|| msg_error): eine tote Beschreibung darf
+# niemals den Run abbrechen oder die VM löschen.
+DESCRIPTION="holaOS VM (${HN}) — Ubuntu 24.04 + holaboss-ai/holaOS. Install: curl -fsSL ${HOLAOS_INSTALL_URL} | sudo bash"
+if ! qm set "$VMID" --description "$DESCRIPTION" >/dev/null 2>&1; then
+  msg_error "VM-Beschreibung konnte nicht gesetzt werden — weiter ohne (harmlos)"
+fi
 # scsi0 kommt aus dem ~2-3 GB Cloud-Image: `size=` in `qm set` wächst ein bereits
 # importiertes Volume NICHT (Platte blieb 3,5 GB statt 30 GB -> ENOSPC im Installer).
 # Daher explizit resizen und am `qm config` verifizieren.
@@ -517,12 +534,12 @@ PVE_8006="unbekannt"; SSH22="unbekannt"
 if ss -ltn 2>/dev/null | grep -q ':8006 '; then PVE_8006="offen (pveproxy lauscht)"; else PVE_8006="ZU (pveproxy/firewall prüfen!)"; fi
 if systemctl is-active --quiet pveproxy 2>/dev/null; then PVE_8006="${PVE_8006}, pveproxy aktiv"; else PVE_8006="${PVE_8006}, pveproxy NICHT aktiv!"; fi
 if [[ -n "$VM_IP" ]]; then
-  if nc -z -w 3 "$VM_IP" 22 2>/dev/null; then SSH22="offen"; else SSH22="noch zu (bootet noch / Firewall)"; fi
+  if port_open "$VM_IP" 22; then SSH22="offen"; else SSH22="noch zu (bootet noch / Firewall)"; fi
   WEB7680="unbekannt"
-  if nc -z -w 3 "$VM_IP" 7680 2>/dev/null; then WEB7680="offen"; else WEB7680="noch zu (Auto-Install läuft noch?)"; fi
+  if port_open "$VM_IP" 7680; then WEB7680="offen"; else WEB7680="noch zu (Auto-Install läuft noch? — braucht 5-15 Min ohne Desktop, 15-30 Min mit Desktop)"; fi
   RDP3389="unbekannt"
   if [[ "$HOLAOS_WITH_DESKTOP" == "1" ]]; then
-    if nc -z -w 3 "$VM_IP" 3389 2>/dev/null; then RDP3389="offen"; else RDP3389="noch zu (Desktop-Install läuft noch?)"; fi
+    if port_open "$VM_IP" 3389; then RDP3389="offen"; else RDP3389="noch zu (Desktop-Install läuft noch? — braucht 15-30 Min)"; fi
   else RDP3389="nicht installiert (HOLAOS_WITH_DESKTOP=1)"; fi
 fi
 echo -e " ── holaOS Ergebnis ───────────────────────────────────"
@@ -555,9 +572,12 @@ fi
 echo -e " Diagnose auf dem Host:"
 echo -e "   qm status $VMID; ss -ltn | grep 8006; systemctl status pveproxy --no-pager | head -5"
 echo -e "   qm guest cmd $VMID network-get-interfaces  # echte VM-IP"
+echo -e "   qm guest exec $VMID -- bash -c 'tail -n 20 /var/log/holaos-install.log'  # Install-Fortschritt OHNE SSH"
+echo -e "   qm guest exec $VMID -- bash -c 'systemctl is-active ttyd xrdp; ss -ltn | grep -E \"7680|3389\"'  # Dienste prüfen"
 if [ "$SNIPPET_OK" == "yes" ]; then
-  echo -e " Auto-Install: LÄUFT beim ersten Boot (~10-20 Min). Log in der VM:"
-  echo -e "   tail -f /var/log/holaos-install.log  /  cloud-init status --wait"
+  echo -e " Auto-Install: LÄUFT beim ersten Boot (ohne Desktop ~5-15 Min, mit Desktop ~15-30 Min)."
+  echo -e "   Warten, dann: qm guest exec $VMID -- bash -c 'tail -n 30 /var/log/holaos-install.log'"
+  echo -e "   In der VM (SSH/Webterminal/Konsole): holaos-status  /  cloud-init status --wait"
 else
   echo -e " Manuell in der VM installieren:"
   echo -e "   curl -fsSL ${HOLAOS_INSTALL_URL} | sudo bash -s -- --ref ${HOLAOS_REF}"
